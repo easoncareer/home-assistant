@@ -31,8 +31,6 @@ CONF_DOMAINS = 'domains'
 CONF_ENTITIES = 'entities'
 CONTINUOUS_DOMAINS = ['proximity', 'sensor']
 
-DEPENDENCIES = ['recorder', 'frontend']
-
 DOMAIN = 'logbook'
 
 GROUP_BY_MINUTES = 15
@@ -104,7 +102,7 @@ async def async_setup(hass, config):
 
     hass.http.register_view(LogbookView(config.get(DOMAIN, {})))
 
-    await hass.components.frontend.async_register_built_in_panel(
+    hass.components.frontend.async_register_built_in_panel(
         'logbook', 'logbook', 'hass:format-list-bulleted-type')
 
     hass.services.async_register(
@@ -146,8 +144,8 @@ class LogbookView(HomeAssistantView):
 
         def json_events():
             """Fetch events and generate JSON."""
-            return self.json(list(
-                _get_events(hass, self.config, start_day, end_day, entity_id)))
+            return self.json(
+                _get_events(hass, self.config, start_day, end_day, entity_id))
 
         return await hass.async_add_job(json_events)
 
@@ -366,8 +364,7 @@ def _get_related_entity_ids(session, entity_filter):
 
             if tryno == RETRIES - 1:
                 raise
-            else:
-                time.sleep(QUERY_RETRY_WAIT)
+            time.sleep(QUERY_RETRY_WAIT)
 
 
 def _generate_filter_from_config(config):
@@ -394,10 +391,16 @@ def _generate_filter_from_config(config):
 def _get_events(hass, config, start_day, end_day, entity_id=None):
     """Get events for a period of time."""
     from homeassistant.components.recorder.models import Events, States
-    from homeassistant.components.recorder.util import (
-        execute, session_scope)
+    from homeassistant.components.recorder.util import session_scope
 
     entities_filter = _generate_filter_from_config(config)
+
+    def yield_events(query):
+        """Yield Events that are not filtered away."""
+        for row in query.yield_per(500):
+            event = row.to_native()
+            if _keep_event(event, entities_filter):
+                yield event
 
     with session_scope(hass=hass) as session:
         if entity_id is not None:
@@ -414,83 +417,76 @@ def _get_events(hass, config, start_day, end_day, entity_id=None):
                      States.entity_id.in_(entity_ids))
                     | (States.state_id.is_(None)))
 
-        events = execute(query)
-
-    return humanify(hass, _exclude_events(events, entities_filter))
+        return list(humanify(hass, yield_events(query)))
 
 
-def _exclude_events(events, entities_filter):
-    filtered_events = []
-    for event in events:
-        domain, entity_id = None, None
+def _keep_event(event, entities_filter):
+    domain, entity_id = None, None
 
-        if event.event_type == EVENT_STATE_CHANGED:
-            entity_id = event.data.get('entity_id')
+    if event.event_type == EVENT_STATE_CHANGED:
+        entity_id = event.data.get('entity_id')
 
-            if entity_id is None:
-                continue
+        if entity_id is None:
+            return False
 
-            # Do not report on new entities
-            if event.data.get('old_state') is None:
-                continue
+        # Do not report on new entities
+        if event.data.get('old_state') is None:
+            return False
 
-            new_state = event.data.get('new_state')
+        new_state = event.data.get('new_state')
 
-            # Do not report on entity removal
-            if not new_state:
-                continue
+        # Do not report on entity removal
+        if not new_state:
+            return False
 
-            attributes = new_state.get('attributes', {})
+        attributes = new_state.get('attributes', {})
 
-            # If last_changed != last_updated only attributes have changed
-            # we do not report on that yet.
-            last_changed = new_state.get('last_changed')
-            last_updated = new_state.get('last_updated')
-            if last_changed != last_updated:
-                continue
+        # If last_changed != last_updated only attributes have changed
+        # we do not report on that yet.
+        last_changed = new_state.get('last_changed')
+        last_updated = new_state.get('last_updated')
+        if last_changed != last_updated:
+            return False
 
-            domain = split_entity_id(entity_id)[0]
+        domain = split_entity_id(entity_id)[0]
 
-            # Also filter auto groups.
-            if domain == 'group' and attributes.get('auto', False):
-                continue
+        # Also filter auto groups.
+        if domain == 'group' and attributes.get('auto', False):
+            return False
 
-            # exclude entities which are customized hidden
-            hidden = attributes.get(ATTR_HIDDEN, False)
-            if hidden:
-                continue
+        # exclude entities which are customized hidden
+        hidden = attributes.get(ATTR_HIDDEN, False)
+        if hidden:
+            return False
 
-        elif event.event_type == EVENT_LOGBOOK_ENTRY:
-            domain = event.data.get(ATTR_DOMAIN)
-            entity_id = event.data.get(ATTR_ENTITY_ID)
+    elif event.event_type == EVENT_LOGBOOK_ENTRY:
+        domain = event.data.get(ATTR_DOMAIN)
+        entity_id = event.data.get(ATTR_ENTITY_ID)
 
-        elif event.event_type == EVENT_AUTOMATION_TRIGGERED:
-            domain = 'automation'
-            entity_id = event.data.get(ATTR_ENTITY_ID)
+    elif event.event_type == EVENT_AUTOMATION_TRIGGERED:
+        domain = 'automation'
+        entity_id = event.data.get(ATTR_ENTITY_ID)
 
-        elif event.event_type == EVENT_SCRIPT_STARTED:
-            domain = 'script'
-            entity_id = event.data.get(ATTR_ENTITY_ID)
+    elif event.event_type == EVENT_SCRIPT_STARTED:
+        domain = 'script'
+        entity_id = event.data.get(ATTR_ENTITY_ID)
 
-        elif event.event_type == EVENT_ALEXA_SMART_HOME:
-            domain = 'alexa'
+    elif event.event_type == EVENT_ALEXA_SMART_HOME:
+        domain = 'alexa'
 
-        elif event.event_type == EVENT_HOMEKIT_CHANGED:
-            domain = DOMAIN_HOMEKIT
+    elif event.event_type == EVENT_HOMEKIT_CHANGED:
+        domain = DOMAIN_HOMEKIT
 
-        if not entity_id and domain:
-            entity_id = "%s." % (domain, )
+    if not entity_id and domain:
+        entity_id = "%s." % (domain, )
 
-        if not entity_id or entities_filter(entity_id):
-            filtered_events.append(event)
-
-    return filtered_events
+    return not entity_id or entities_filter(entity_id)
 
 
 def _entry_message_from_state(domain, state):
     """Convert a state to a message for the logbook."""
     # We pass domain in so we don't have to split entity_id again
-    if domain == 'device_tracker':
+    if domain in ['device_tracker', 'person']:
         if state.state == STATE_NOT_HOME:
             return 'is away'
         return 'is at {}'.format(state.state)
@@ -499,6 +495,59 @@ def _entry_message_from_state(domain, state):
         if state.state == sun.STATE_ABOVE_HORIZON:
             return 'has risen'
         return 'has set'
+
+    device_class = state.attributes.get('device_class')
+    if domain == 'binary_sensor' and device_class:
+        if device_class == 'battery':
+            if state.state == STATE_ON:
+                return "is low"
+            if state.state == STATE_OFF:
+                return "is normal"
+
+        if device_class == 'connectivity':
+            if state.state == STATE_ON:
+                return "is connected"
+            if state.state == STATE_OFF:
+                return "is disconnected"
+
+        if device_class in ['door', 'garage_door', 'opening', 'window']:
+            if state.state == STATE_ON:
+                return "is opened"
+            if state.state == STATE_OFF:
+                return "is closed"
+
+        if device_class == 'lock':
+            if state.state == STATE_ON:
+                return "is unlocked"
+            if state.state == STATE_OFF:
+                return "is locked"
+
+        if device_class == 'plug':
+            if state.state == STATE_ON:
+                return "is plugged in"
+            if state.state == STATE_OFF:
+                return "is unplugged"
+
+        if device_class == 'presence':
+            if state.state == STATE_ON:
+                return "is at home"
+            if state.state == STATE_OFF:
+                return "is away"
+
+        if device_class == 'safety':
+            if state.state == STATE_ON:
+                return "is unsafe"
+            if state.state == STATE_OFF:
+                return "is safe"
+
+        if (device_class in [
+                'cold', 'gas', 'heat', 'light', 'moisture', 'motion',
+                'occupancy', 'power', 'problem', 'smoke', 'sound', 'vibration'
+                ]):
+            if state.state == STATE_ON:
+                return "detected {}".format(device_class)
+            if state.state == STATE_OFF:
+                return "cleared (no {} detected)".format(device_class)
 
     if state.state == STATE_ON:
         # Future: combine groups and its entity entries ?

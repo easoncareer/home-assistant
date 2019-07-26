@@ -1,14 +1,5 @@
-"""
-Support for Google - Calendar Event Devices.
-
-For more details about this platform, please refer to the documentation at
-https://home-assistant.io/components/google/
-
-NOTE TO OTHER DEVELOPERS: IF YOU ADD MORE SCOPES TO THE OAUTH THAN JUST
-CALENDAR THEN USERS WILL NEED TO DELETE THEIR TOKEN_FILE. THEY WILL LOSE THEIR
-REFRESH_TOKEN PIECE WHEN RE-AUTHENTICATING TO ADD MORE API ACCESS
-IT'S BEST TO JUST HAVE SEPARATE OAUTH FOR DIFFERENT PIECES OF GOOGLE
-"""
+"""Support for Google - Calendar Event Devices."""
+from datetime import timedelta, datetime
 import logging
 import os
 import yaml
@@ -22,12 +13,6 @@ from homeassistant.helpers import discovery
 from homeassistant.helpers.entity import generate_entity_id
 from homeassistant.helpers.event import track_time_change
 from homeassistant.util import convert, dt
-
-REQUIREMENTS = [
-    'google-api-python-client==1.6.4',
-    'httplib2==0.10.3',
-    'oauth2client==4.0.0',
-]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,21 +31,37 @@ CONF_TRACK = 'track'
 CONF_SEARCH = 'search'
 CONF_OFFSET = 'offset'
 CONF_IGNORE_AVAILABILITY = 'ignore_availability'
+CONF_MAX_RESULTS = 'max_results'
 
 DEFAULT_CONF_TRACK_NEW = True
 DEFAULT_CONF_OFFSET = '!!'
 
+EVENT_CALENDAR_ID = 'calendar_id'
+EVENT_DESCRIPTION = 'description'
+EVENT_END_CONF = 'end'
+EVENT_END_DATE = 'end_date'
+EVENT_END_DATETIME = 'end_date_time'
+EVENT_IN = 'in'
+EVENT_IN_DAYS = 'days'
+EVENT_IN_WEEKS = 'weeks'
+EVENT_START_CONF = 'start'
+EVENT_START_DATE = 'start_date'
+EVENT_START_DATETIME = 'start_date_time'
+EVENT_SUMMARY = 'summary'
+EVENT_TYPES_CONF = 'event_types'
+
 NOTIFICATION_ID = 'google_calendar_notification'
-NOTIFICATION_TITLE = 'Google Calendar Setup'
+NOTIFICATION_TITLE = "Google Calendar Setup"
 GROUP_NAME_ALL_CALENDARS = "Google Calendar Sensors"
 
 SERVICE_SCAN_CALENDARS = 'scan_for_calendars'
 SERVICE_FOUND_CALENDARS = 'found_calendar'
+SERVICE_ADD_EVENT = 'add_event'
 
 DATA_INDEX = 'google_calendars'
 
 YAML_DEVICES = '{}_calendars.yaml'.format(DOMAIN)
-SCOPES = 'https://www.googleapis.com/auth/calendar.readonly'
+SCOPES = 'https://www.googleapis.com/auth/calendar'
 
 TOKEN_FILE = '.{}.token'.format(DOMAIN)
 
@@ -75,10 +76,11 @@ CONFIG_SCHEMA = vol.Schema({
 _SINGLE_CALSEARCH_CONFIG = vol.Schema({
     vol.Required(CONF_NAME): cv.string,
     vol.Required(CONF_DEVICE_ID): cv.string,
-    vol.Optional(CONF_TRACK): cv.boolean,
-    vol.Optional(CONF_SEARCH): cv.string,
-    vol.Optional(CONF_OFFSET): cv.string,
     vol.Optional(CONF_IGNORE_AVAILABILITY, default=True): cv.boolean,
+    vol.Optional(CONF_OFFSET): cv.string,
+    vol.Optional(CONF_SEARCH): cv.string,
+    vol.Optional(CONF_TRACK): cv.boolean,
+    vol.Optional(CONF_MAX_RESULTS): cv.positive_int,
 })
 
 DEVICE_SCHEMA = vol.Schema({
@@ -86,6 +88,27 @@ DEVICE_SCHEMA = vol.Schema({
     vol.Required(CONF_ENTITIES, None):
         vol.All(cv.ensure_list, [_SINGLE_CALSEARCH_CONFIG]),
 }, extra=vol.ALLOW_EXTRA)
+
+_EVENT_IN_TYPES = vol.Schema(
+    {
+        vol.Exclusive(EVENT_IN_DAYS, EVENT_TYPES_CONF): cv.positive_int,
+        vol.Exclusive(EVENT_IN_WEEKS, EVENT_TYPES_CONF): cv.positive_int,
+    }
+)
+
+ADD_EVENT_SERVICE_SCHEMA = vol.Schema(
+    {
+        vol.Required(EVENT_CALENDAR_ID): cv.string,
+        vol.Required(EVENT_SUMMARY): cv.string,
+        vol.Optional(EVENT_DESCRIPTION, default=""): cv.string,
+        vol.Exclusive(EVENT_START_DATE, EVENT_START_CONF): cv.date,
+        vol.Exclusive(EVENT_END_DATE, EVENT_END_CONF): cv.date,
+        vol.Exclusive(EVENT_START_DATETIME, EVENT_START_CONF): cv.datetime,
+        vol.Exclusive(EVENT_END_DATETIME, EVENT_END_CONF): cv.datetime,
+        vol.Exclusive(EVENT_IN, EVENT_START_CONF, EVENT_END_CONF):
+        _EVENT_IN_TYPES
+    }
+)
 
 
 def do_authentication(hass, hass_config, config):
@@ -95,19 +118,15 @@ def do_authentication(hass, hass_config, config):
     until we have an access token.
     """
     from oauth2client.client import (
-        OAuth2WebServerFlow,
-        OAuth2DeviceCodeError,
-        FlowExchangeError
-    )
+        OAuth2WebServerFlow, OAuth2DeviceCodeError, FlowExchangeError)
     from oauth2client.file import Storage
 
     oauth = OAuth2WebServerFlow(
         client_id=config[CONF_CLIENT_ID],
         client_secret=config[CONF_CLIENT_SECRET],
-        scope='https://www.googleapis.com/auth/calendar.readonly',
+        scope='https://www.googleapis.com/auth/calendar',
         redirect_uri='Home-Assistant.io',
     )
-
     try:
         dev_flow = oauth.step1_get_device_and_user_codes()
     except OAuth2DeviceCodeError as err:
@@ -152,8 +171,8 @@ def do_authentication(hass, hass_config, config):
             'been found'.format(YAML_DEVICES),
             title=NOTIFICATION_TITLE, notification_id=NOTIFICATION_ID)
 
-    listener = track_time_change(hass, step2_exchange,
-                                 second=range(0, 60, dev_flow.interval))
+    listener = track_time_change(
+        hass, step2_exchange, second=range(0, 60, dev_flow.interval))
 
     return True
 
@@ -164,13 +183,28 @@ def setup(hass, config):
         hass.data[DATA_INDEX] = {}
 
     conf = config.get(DOMAIN, {})
+    if not conf:
+        # component is set up by tts platform
+        return True
 
     token_file = hass.config.path(TOKEN_FILE)
     if not os.path.isfile(token_file):
         do_authentication(hass, config, conf)
     else:
-        do_setup(hass, config, conf)
+        if not check_correct_scopes(token_file):
+            do_authentication(hass, config, conf)
+        else:
+            do_setup(hass, config, conf)
 
+    return True
+
+
+def check_correct_scopes(token_file):
+    """Check for the correct scopes in file."""
+    tokenfile = open(token_file, "r").read()
+    if "readonly" in tokenfile:
+        _LOGGER.warning("Please re-authenticate with Google.")
+        return False
     return True
 
 
@@ -209,6 +243,61 @@ def setup_services(hass, hass_config, track_new_found_calendars,
 
     hass.services.register(
         DOMAIN, SERVICE_SCAN_CALENDARS, _scan_for_calendars)
+
+    def _add_event(call):
+        """Add a new event to calendar."""
+        service = calendar_service.get()
+        start = {}
+        end = {}
+
+        if EVENT_IN in call.data:
+            if EVENT_IN_DAYS in call.data[EVENT_IN]:
+                now = datetime.now()
+
+                start_in = now + timedelta(
+                    days=call.data[EVENT_IN][EVENT_IN_DAYS])
+                end_in = start_in + timedelta(days=1)
+
+                start = {'date': start_in.strftime('%Y-%m-%d')}
+                end = {'date': end_in.strftime('%Y-%m-%d')}
+
+            elif EVENT_IN_WEEKS in call.data[EVENT_IN]:
+                now = datetime.now()
+
+                start_in = now + timedelta(
+                    weeks=call.data[EVENT_IN][EVENT_IN_WEEKS])
+                end_in = start_in + timedelta(days=1)
+
+                start = {'date': start_in.strftime('%Y-%m-%d')}
+                end = {'date': end_in.strftime('%Y-%m-%d')}
+
+        elif EVENT_START_DATE in call.data:
+            start = {'date': str(call.data[EVENT_START_DATE])}
+            end = {'date': str(call.data[EVENT_END_DATE])}
+
+        elif EVENT_START_DATETIME in call.data:
+            start_dt = str(call.data[EVENT_START_DATETIME]
+                           .strftime('%Y-%m-%dT%H:%M:%S'))
+            end_dt = str(call.data[EVENT_END_DATETIME]
+                         .strftime('%Y-%m-%dT%H:%M:%S'))
+            start = {'dateTime': start_dt,
+                     'timeZone': str(hass.config.time_zone)}
+            end = {'dateTime': end_dt,
+                   'timeZone': str(hass.config.time_zone)}
+
+        event = {
+            'summary': call.data[EVENT_SUMMARY],
+            'description': call.data[EVENT_DESCRIPTION],
+            'start': start,
+            'end': end,
+        }
+        service_data = {'calendarId': call.data[EVENT_CALENDAR_ID],
+                        'body': event}
+        event = service.events().insert(**service_data).execute()
+
+    hass.services.register(
+        DOMAIN, SERVICE_ADD_EVENT, _add_event, schema=ADD_EVENT_SERVICE_SCHEMA
+    )
     return True
 
 

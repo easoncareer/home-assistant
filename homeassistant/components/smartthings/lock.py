@@ -1,23 +1,26 @@
 """Support for locks through the SmartThings cloud API."""
 from typing import Optional, Sequence
 
+from pysmartthings import Attribute, Capability
+
 from homeassistant.components.lock import LockDevice
 
 from . import SmartThingsEntity
 from .const import DATA_BROKERS, DOMAIN
 
-DEPENDENCIES = ['smartthings']
-
 ST_STATE_LOCKED = 'locked'
 ST_LOCK_ATTR_MAP = {
-    'method': 'method',
     'codeId': 'code_id',
-    'timeout': 'timeout'
+    'codeName': 'code_name',
+    'lockName': 'lock_name',
+    'method': 'method',
+    'timeout': 'timeout',
+    'usedCode': 'used_code'
 }
 
 
-async def async_setup_platform(hass, config, async_add_entities,
-                               discovery_info=None):
+async def async_setup_platform(
+        hass, config, async_add_entities, discovery_info=None):
     """Platform uses config entry setup."""
     pass
 
@@ -32,8 +35,6 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
 
 def get_capabilities(capabilities: Sequence[str]) -> Optional[Sequence[str]]:
     """Return all capabilities supported if minimum required are present."""
-    from pysmartthings import Capability
-
     if Capability.lock in capabilities:
         return [Capability.lock]
     return None
@@ -60,7 +61,6 @@ class SmartThingsLock(SmartThingsEntity, LockDevice):
     @property
     def device_state_attributes(self):
         """Return device specific state attributes."""
-        from pysmartthings import Attribute
         state_attrs = {}
         status = self._device.status.attributes[Attribute.lock]
         if status.value:
