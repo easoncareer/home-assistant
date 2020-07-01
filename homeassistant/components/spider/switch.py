@@ -1,10 +1,9 @@
 """Support for Spider switches."""
 import logging
 
-from homeassistant.components.spider import DOMAIN as SPIDER_DOMAIN
-from homeassistant.components.switch import SwitchDevice
+from homeassistant.components.switch import SwitchEntity
 
-DEPENDENCIES = ['spider']
+from . import DOMAIN as SPIDER_DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -14,13 +13,15 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
     if discovery_info is None:
         return
 
-    devices = [SpiderPowerPlug(hass.data[SPIDER_DOMAIN]['controller'], device)
-               for device in hass.data[SPIDER_DOMAIN]['power_plugs']]
+    devices = [
+        SpiderPowerPlug(hass.data[SPIDER_DOMAIN]["controller"], device)
+        for device in hass.data[SPIDER_DOMAIN]["power_plugs"]
+    ]
 
     add_entities(devices, True)
 
 
-class SpiderPowerPlug(SwitchDevice):
+class SpiderPowerPlug(SwitchEntity):
     """Representation of a Spider Power Plug."""
 
     def __init__(self, api, power_plug):
